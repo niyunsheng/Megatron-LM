@@ -960,7 +960,7 @@ class TestDSAHelperEdgeCases:
 
     def test_indexer_flops_zero_layers(self):
         """No indexer layers contribute nothing."""
-        from megatron.training.training import _dsa_indexer_flops
+        from megatron.training.logging.dsa_flops import _dsa_indexer_flops
 
         assert _dsa_indexer_flops(
             hidden_size=512,
@@ -975,7 +975,7 @@ class TestDSAHelperEdgeCases:
         """Direct check of the fwd/bwd expansion factors on the scoring term:
         dense KL pays 3x, sparse KL pays ``1 + 2 * sparse_core_scale``, and a
         frozen indexer pays 1x regardless of the loss variant."""
-        from megatron.training.training import _dsa_indexer_flops
+        from megatron.training.logging.dsa_flops import _dsa_indexer_flops
 
         common = dict(
             hidden_size=512, q_lora_rank=128, n_heads=4, head_dim=32, num_indexer_layers=1
@@ -1007,7 +1007,7 @@ class TestDSAHelperEdgeCases:
 
     def test_sparse_core_scale_degenerate_inputs(self):
         """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
-        from megatron.training.training import _dsa_sparse_core_scale
+        from megatron.training.logging.dsa_flops import _dsa_sparse_core_scale
 
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
