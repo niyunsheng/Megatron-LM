@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import megatron.training.training as training_module
+from megatron.training.logging.dsa_flops import dsa_flops
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
@@ -800,7 +801,7 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers
     """Independent golden calculator for standard-path DSA FLOPs.
 
     Reimplements the formula from ``num_floating_point_operations`` so that
-    the test does not just call the same code twice. Assumes no MoE / MTP.
+    the test does not just call the same code twice. Assumes dense MLPs.
     ``num_indexer_layers`` defaults to every layer, which is what
     ``dsa_indexer_topk_freq=1`` / ``dsa_indexer_skip_topk_offset=0`` give;
     cross-layer sharing cases pass the expected count explicitly.
@@ -808,7 +809,8 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers
     fwd_bwd = 3
     fma = 2
     ffn_exp = 3 if args.swiglu else 2
-    num_layers = args.num_layers
+    mtp_num_layers = args.mtp_num_layers or 0
+    num_layers = args.num_layers + mtp_num_layers
 
     if num_indexer_layers is None:
         num_indexer_layers = num_layers
@@ -817,11 +819,13 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers
     )
 
     mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
-    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size
+    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+    mtp = fwd_bwd * fma * mtp_num_layers * (3 * args.hidden_size + 2 * args.hidden_size**2)
 
     # Match the public counter's integer result after summing all FLOPs terms.
     return int(
-        total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+        total_tokens * (mlp + self_attn_term + mtp + logit)
+        + seqlen_squared_sum * self_attn_core_term
     )
 
 
@@ -968,6 +972,22 @@ class TestDSA:
         dense.experimental_attention_variant = None
         assert corrected < num_floating_point_operations(dense, batch_size)
 
+    def test_mtp_layers_continue_decoder_numbering(self):
+        """Standard DSA numbers the four decoder and two MTP layers 1..6.
+
+        With freq=4, offset=1, only layers 1 and 5 run the indexer. The total
+        must also include all six MLPs, three logits, and both MTP projections.
+        """
+        args = _make_dsa_args()
+        args.mtp_num_layers = 2
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        batch = 2
+        expected = _dsa_golden_flops(
+            args, batch * args.seq_length, batch * args.seq_length**2, num_indexer_layers=2
+        )
+        assert num_floating_point_operations(args, batch) == expected
+
 
 class TestDSAHelperEdgeCases:
     """Direct coverage of the helper guards and hybrid variant handling."""
@@ -1059,15 +1079,45 @@ def _make_hybrid_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_lo
     return args
 
 
+class TestDSAEntryPoint:
+    """The shared counter preserves each model's indexer layer numbering."""
+
+    @pytest.mark.parametrize("pattern, num_indexer_layers", [(None, 2), ("D-D-|D-D-/D-/D-", 4)])
+    @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
+    @pytest.mark.parametrize("sparse_loss", [False, True])
+    def test_shared_attention_terms(self, pattern, num_indexer_layers, loss_coeff, sparse_loss):
+        """Both models have six DSA layers but different indexer counts.
+
+        Standard layers 1 and 5 compute an index. The hybrid main pattern
+        computes at positions 1 and 5, plus position 1 in each MTP depth.
+        Pipeline separators must not affect that numbering.
+        """
+        args = _make_hybrid_dsa_args(loss_coeff, sparse_loss)
+        args.hybrid_layer_pattern = pattern
+        args.num_layers = 4 if pattern is None else 8
+        args.mtp_num_layers = 2
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        total_tokens = 2 * args.seq_length
+        sum_sq = 2 * args.seq_length**2
+        token_term, core_term = _dsa_golden_layer_terms(
+            args, total_tokens, sum_sq, num_dsa_layers=6, num_indexer_layers=num_indexer_layers
+        )
+        assert dsa_flops(args, total_tokens, sum_sq, num_dsa_layers=6) == (
+            total_tokens * token_term + sum_sq * core_term
+        )
+
+    def test_no_dsa_layers_needs_no_dsa_arguments(self):
+        """Non-DSA hybrid models can call the counter without DSA fields."""
+        assert dsa_flops(SimpleNamespace(), 512, 131072, num_dsa_layers=0) == 0
+
+
 class TestHybridDSA:
     """Hybrid-path ('D' layers in --hybrid-layer-pattern) DSA accounting.
 
-    On this branch the hybrid path is the one that actually builds DSA
-    models (the standard GPT path rejects experimental attention variants),
-    so 'D' layers must be counted, not asserted away. 'D' layers previously
-    contributed nothing to ``hybrid_flops``, so deleting them from the
-    pattern leaves every other term unchanged -- the delta against the
-    D-less pattern isolates exactly the DSA terms.
+    'D' layers contribute through ``dsa_flops``; deleting them from the
+    pattern leaves every other term unchanged. The delta against the
+    D-less pattern therefore isolates exactly the DSA terms.
     """
 
     def _delta(self, args, pattern_with_d, pattern_without_d, batch=2):

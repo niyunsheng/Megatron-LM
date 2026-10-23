@@ -165,12 +165,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
-from megatron.training.logging.dsa_flops import (
-    _dsa_indexer_flops,
-    _dsa_sparse_core_scale,
-    _num_dsa_indexer_layers,
-    dsa_flops,
-)
+from megatron.training.logging.dsa_flops import dsa_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -1118,6 +1113,12 @@ def num_floating_point_operations(
         # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
+        if args.experimental_attention_variant == "dsa":
+            # The shared DSA counter includes all attention and indexer work.
+            # Add it after the MLP, MTP, and logit terms below.
+            standard_self_attn_term = 0
+            standard_self_attn_core_term = 0
+        elif args.multi_latent_attention:
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1209,8 +1210,6 @@ def num_floating_point_operations(
                 * 2  # QK^T and (QK^T)V
             )
 
-        dsa_extra_term = 0
-        dsa_extra_core_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # The attention pattern describes only the main decoder layers.
             if isinstance(args.linear_attention_freq, int):
@@ -1281,54 +1280,6 @@ def num_floating_point_operations(
                     "Invalid experimental_attention_variant: "
                     f"{args.experimental_attention_variant}"
                 )
-        elif args.experimental_attention_variant == "dsa":
-            # DSA (e.g. GLM-5.2). The MLA projections are unchanged -- absorption
-            # relocates the same W_UK/W_UV GEMMs (per-token K/V up-projection
-            # becomes per-token q-side and output-side absorption of identical
-            # cost) -- so the standard token-linear term computed above still
-            # applies. Core attention differs from plain MLA in two ways:
-            #   * DSA always executes the absorbed-MLA path
-            #     (``AbsorbedMLASelfAttention``): ``QK^T`` is formed over the
-            #     compressed KV latent, spanning
-            #     ``kv_lora_rank + qk_pos_emb_head_dim`` per head, and ``AV``
-            #     spans ``kv_lora_rank`` -- not the up-projected
-            #     (``qk_head_dim``, ``v_head_dim``) counted for plain MLA
-            #     above. Each branch counts the form its variant executes.
-            #   * Attention runs over the indexer's top-k keys instead of the
-            #     full causal mask, so the dense causal coefficient is scaled
-            #     down to the top-k pair count.
-            # The indexer itself adds projections plus its own dense O(L^2)
-            # scoring pass; it carries its own (KL-loss-dependent) fwd/bwd
-            # expansion instead of the global factor of 3 -- see
-            # ``_dsa_indexer_flops``.
-            num_linear_attention_layers = 0
-            linear_self_attn_term = 0
-            num_standard_attention_layers = num_layers
-
-            dsa_sparse_core_scale = _dsa_sparse_core_scale(
-                total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
-            )
-            standard_self_attn_core_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
-                    + args.num_attention_heads * args.kv_lora_rank / 2
-                )
-                * dsa_sparse_core_scale
-            )
-            dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
-                hidden_size=args.hidden_size,
-                q_lora_rank=args.q_lora_rank,
-                n_heads=args.dsa_indexer_n_heads,
-                head_dim=args.dsa_indexer_head_dim,
-                num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
-                ),
-                dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
-                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
-                sparse_core_scale=dsa_sparse_core_scale,
-            )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1339,15 +1290,9 @@ def num_floating_point_operations(
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
-            + dsa_extra_term
         )
-        # Core attention (L^2) FLOPs per standard-attention layer. For DSA the
-        # standard coefficient is already the top-k-scaled absorbed form, and
-        # the extra term carries the indexer's dense scoring.
-        self_attn_core_term = (
-            standard_self_attn_core_term * num_standard_attention_layers
-            + dsa_extra_core_term
-        )
+        # Core attention (L^2) FLOPs per standard-attention layer.
+        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
 
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
@@ -1407,6 +1352,13 @@ def num_floating_point_operations(
             # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
             + seqlen_squared_sum_in_batch * self_attn_core_term
         )
+        if args.experimental_attention_variant == "dsa":
+            total_floating_point_operations += dsa_flops(
+                args=args,
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                num_dsa_layers=num_layers,
+            )
         return total_floating_point_operations
 
     def _uses_gated_delta_product_spec(args):

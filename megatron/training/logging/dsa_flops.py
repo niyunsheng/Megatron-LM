@@ -169,12 +169,11 @@ def _num_dsa_indexer_layers_in_pattern(layer_types, dsa_symbol, skip_topk_offset
 
 
 def _dsa_layer_flops(args, total_real_tokens, seqlen_squared_sum):
-    """Per-DSA-layer FLOPs coefficients for the hybrid-model path.
+    """Per-DSA-layer FLOPs coefficients shared by standard and hybrid models.
 
     Returns ``(token_linear, core)`` INCLUDING the fwd+bwd (x3) and FMA (x2)
     expansion factors. Multiply ``token_linear`` by the real token count and
-    ``core`` by ``sum_i(L_i ** 2)``. The formulas mirror the standard-path
-    ``"dsa"`` branch in ``transformer_flops``:
+    ``core`` by ``sum_i(L_i ** 2)``. Both model paths use the same formulas:
 
       * token-linear: the plain-MLA projection cost (q/kv lora, RoPE, output
         projection). Absorption relocates the same ``W_UK``/``W_UV`` GEMMs, so
@@ -233,26 +232,32 @@ def _dsa_layer_flops(args, total_real_tokens, seqlen_squared_sum):
 def dsa_flops(
     args: Namespace, total_tokens: float, seqlen_squared_sum: float, num_dsa_layers: int
 ) -> float:
-    """Calculate the DSA contribution to hybrid-model training FLOPs.
+    """Calculate DSA attention and indexer FLOPs for standard or hybrid models.
 
     Counts absorbed-MLA projections and top-k sparse core attention for every
     DSA layer, plus the lightning indexer on layers that compute their own
     top-k. Both terms already include their forward/backward and FMA factors;
-    add this result to ``hybrid_flops`` without another x3 expansion.
+    add this result to the model's other FLOPs without another x3 expansion.
+
+    Standard models number DSA layers consecutively, including MTP layers.
+    Hybrid models use the positions in ``hybrid_layer_pattern`` and restart
+    numbering for each MTP depth. Only indexer layer counting differs; the
+    projections, sparse attention, and indexer formulas are shared.
 
     Args:
-        args: Megatron arguments, including the hybrid pattern and DSA dimensions.
-            The pattern determines DSA layers independently of
-            ``experimental_attention_variant``, which hybrid configuration
-            sets on the model config rather than on the arguments.
+        args: Megatron arguments, including DSA dimensions and an optional
+            ``hybrid_layer_pattern``. A non-None pattern selects hybrid layer
+            numbering independently of ``experimental_attention_variant``.
         total_tokens: Real (unpadded) token count in the global batch.
         seqlen_squared_sum: Sum of squared real sequence lengths in that batch.
-        num_dsa_layers: DSA layer count from ``get_hybrid_layer_counts``, including
-            MTP depths. Zero returns immediately without reading DSA arguments.
+        num_dsa_layers: Total DSA attention layers, including MTP. For standard
+            models this is ``num_layers + mtp_num_layers``; for hybrid models
+            use the DSA count from ``get_hybrid_layer_counts``. Zero returns
+            immediately without reading DSA arguments.
 
     Returns:
-        Training FLOPs for DSA attention and its indexer, excluding other hybrid
-        layers, logits, and MTP norms/projections accounted for by ``hybrid_flops``.
+        Training FLOPs for DSA attention and its indexer. Callers account for
+        MLPs, other layer types, logits, and MTP norms/projections separately.
     """
     if num_dsa_layers == 0:
         return 0.0
@@ -260,24 +265,32 @@ def dsa_flops(
     per_layer_token_linear, per_layer_core = _dsa_layer_flops(
         args, total_tokens, seqlen_squared_sum
     )
-    # DSAttention's skip predicate runs on block-local layer numbers:
-    # the main pattern numbers layers sequentially across pipes, and
-    # each hybrid MTP depth restarts at 1 (``pp_layer_offset=0``).
-    parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
-    main_layer_types = (parsed_pattern.main_pattern or "").replace(Symbols.PIPE, "")
-    num_indexer_layers = _num_dsa_indexer_layers_in_pattern(
-        main_layer_types,
-        Symbols.DS_ATTENTION,
-        args.dsa_indexer_skip_topk_offset,
-        args.dsa_indexer_topk_freq,
-    )
-    if parsed_pattern.mtp_pattern:
-        num_indexer_layers += parsed_pattern.mtp_num_depths * _num_dsa_indexer_layers_in_pattern(
-            parsed_pattern.mtp_pattern,
+    if args.hybrid_layer_pattern is None:
+        num_indexer_layers = _num_dsa_indexer_layers(
+            num_dsa_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+        )
+    else:
+        # DSAttention's skip predicate runs on block-local layer numbers:
+        # the main pattern numbers layers sequentially across pipes, and
+        # each hybrid MTP depth restarts at 1 (``pp_layer_offset=0``).
+        parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+        main_layer_types = (parsed_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+        num_indexer_layers = _num_dsa_indexer_layers_in_pattern(
+            main_layer_types,
             Symbols.DS_ATTENTION,
             args.dsa_indexer_skip_topk_offset,
             args.dsa_indexer_topk_freq,
         )
+        if parsed_pattern.mtp_pattern:
+            num_indexer_layers += (
+                parsed_pattern.mtp_num_depths
+                * _num_dsa_indexer_layers_in_pattern(
+                    parsed_pattern.mtp_pattern,
+                    Symbols.DS_ATTENTION,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                )
+            )
     indexer_token_linear, indexer_core = _dsa_indexer_flops(
         hidden_size=args.hidden_size,
         q_lora_rank=args.q_lora_rank,
