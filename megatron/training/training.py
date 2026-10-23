@@ -998,7 +998,7 @@ def num_floating_point_operations(
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     gdp_num_householder,
+                     num_dsa_layers, gdp_num_householder,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -1012,7 +1012,7 @@ def num_floating_point_operations(
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
                      vocab_size=256000, mtp_num_layers=0):
-        """Calculate total FLOPs for the hybrid model."""
+        """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
@@ -1039,7 +1039,17 @@ def num_floating_point_operations(
                                                   gdn_conv_kernel_dim, gdn_use_gdn2) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
-        return flops_fwd * 3
+        # DSA includes its own attention and indexer forward/backward factors.
+        # Only the other layers receive the common x3 expansion here.
+        return (
+            dsa_flops(
+                args=args,
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                num_dsa_layers=num_dsa_layers,
+            )
+            + flops_fwd * 3
+        )
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1400,13 +1410,7 @@ def num_floating_point_operations(
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return int(
-            dsa_flops(
-                args=args,
-                total_tokens=total_real_tokens_in_batch,
-                seqlen_squared_sum=seqlen_squared_sum_in_batch,
-                num_dsa_layers=layer_counts[Symbols.DS_ATTENTION],
-            )
-            + hybrid_flops(
+            hybrid_flops(
                 total_tokens=total_real_tokens_in_batch,
                 seqlen_squared_sum=seqlen_squared_sum_in_batch,
                 hidden_size=args.hidden_size,
@@ -1414,6 +1418,7 @@ def num_floating_point_operations(
                 num_mamba_layers=num_mamba_layers,
                 num_mlp_layers=num_mlp_layers,
                 num_moe_layers=num_moe_layers,
+                num_dsa_layers=layer_counts[Symbols.DS_ATTENTION],
                 num_gdn_layers=num_gdn_layers,
                 mamba_state_dim=args.mamba_state_dim,
                 mamba_head_dim=args.mamba_head_dim,
