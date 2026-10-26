@@ -118,6 +118,7 @@ def _dsa_indexer_flops(
     # Scoring each query against every past token under a causal mask (/2).
     core = num_indexer_layers * index_dim / 2
     fma_expansion_factor = 2
+    core_expansion: float
     if not dsa_indexer_loss_enabled:
         token_expansion, core_expansion = 1, 1
     else:
@@ -168,22 +169,18 @@ def _num_dsa_indexer_layers_in_pattern(layer_types, dsa_symbol, skip_topk_offset
     )
 
 
-def _dsa_layer_flops(args, total_real_tokens, seqlen_squared_sum):
-    """Per-DSA-layer FLOPs coefficients shared by standard and hybrid models.
+def dsa_layer_flops(args: Namespace, total_tokens: float, seqlen_squared_sum: float) -> float:
+    """Calculate forward FLOPs for one DSA attention layer, excluding its indexer.
 
-    Returns ``(token_linear, core)`` INCLUDING the fwd+bwd (x3) and FMA (x2)
-    expansion factors. Multiply ``token_linear`` by the real token count and
-    ``core`` by ``sum_i(L_i ** 2)``. Both model paths use the same formulas:
+    Like the other layer counters, the result includes the FMA factor of two
+    and the batch token statistics, but no backward expansion or layer count.
+    Callers multiply by the number of DSA layers and apply their common x3
+    forward/backward expansion.
 
-      * token-linear: the plain-MLA projection cost (q/kv lora, RoPE, output
-        projection). Absorption relocates the same ``W_UK``/``W_UV`` GEMMs, so
-        the absorbed form costs the same per token.
-      * core: the absorbed-MLA form (``QK^T`` over
-        ``kv_lora_rank + qk_pos_emb_head_dim`` per head, ``AV`` over
-        ``kv_lora_rank``), scaled down to the indexer's top-k pair count.
-
-    The indexer is NOT included here -- only ``dsa_indexer_topk_freq``-spaced
-    layers pay it; callers add ``_dsa_indexer_flops`` separately.
+    Token-linear work includes the MLA projections and their norm estimates.
+    Core attention uses the absorbed KV dimensions and top-k sparse pair scale.
+    The indexer is accounted for separately by ``dsa_indexer_flops`` because
+    its executed layer count and backward cost can differ from attention.
     """
     if args.q_lora_rank is None:
         q_term = (
@@ -197,74 +194,56 @@ def _dsa_layer_flops(args, total_real_tokens, seqlen_squared_sum):
             + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
             + 1
         )
-    forward_backward_expansion_factor = 3
     fma_expansion_factor = 2
-    token_linear = (
-        forward_backward_expansion_factor
-        * fma_expansion_factor
-        * (
-            ## q lora + rope + q norm
-            q_term
-            ## kv lora + rope + kv norm
-            + args.kv_lora_rank
-            * (
-                args.hidden_size
-                + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
-                + 1
-            )
-            + args.hidden_size * args.qk_pos_emb_head_dim
-            ## o proj
-            + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-        )
+    token_linear = fma_expansion_factor * (
+        ## q lora + rope + q norm
+        q_term
+        ## kv lora + rope + kv norm
+        + args.kv_lora_rank
+        * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 1)
+        + args.hidden_size * args.qk_pos_emb_head_dim
+        ## o proj
+        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
     )
     core = (
-        forward_backward_expansion_factor
-        * fma_expansion_factor
+        fma_expansion_factor
         * (
             args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
             + args.num_attention_heads * args.kv_lora_rank / 2
         )
-        * _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, args.dsa_indexer_topk)
+        * _dsa_sparse_core_scale(total_tokens, seqlen_squared_sum, args.dsa_indexer_topk)
     )
-    return token_linear, core
+    return total_tokens * token_linear + seqlen_squared_sum * core
 
 
-def dsa_flops(
+def dsa_indexer_flops(
     args: Namespace, total_tokens: float, seqlen_squared_sum: float, num_dsa_layers: int
 ) -> float:
-    """Calculate DSA attention and indexer FLOPs for standard or hybrid models.
+    """Calculate indexer training FLOPs across standard or hybrid DSA layers.
 
-    Counts absorbed-MLA projections and top-k sparse core attention for every
-    DSA layer, plus the lightning indexer on layers that compute their own
-    top-k. Both terms already include their forward/backward and FMA factors;
-    add this result to the model's other FLOPs without another x3 expansion.
+    Only layers computing their own top-k index contribute. Standard models
+    number decoder and MTP layers consecutively; hybrid models use pattern
+    positions across pipeline separators and restart numbering per MTP depth.
 
-    Standard models number DSA layers consecutively, including MTP layers.
-    Hybrid models use the positions in ``hybrid_layer_pattern`` and restart
-    numbering for each MTP depth. Only indexer layer counting differs; the
-    projections, sparse attention, and indexer formulas are shared.
+    The result includes the indexer's loss-dependent forward/backward factors
+    and FMA factor. Add it after the model's common x3 expansion. Attention,
+    MLPs, logits, and MTP norms/projections are accounted for by the caller.
 
     Args:
-        args: Megatron arguments, including DSA dimensions and an optional
-            ``hybrid_layer_pattern``. A non-None pattern selects hybrid layer
-            numbering independently of ``experimental_attention_variant``.
+        args: Megatron arguments, including DSA dimensions, loss settings,
+            index-sharing settings, and optional ``hybrid_layer_pattern``.
         total_tokens: Real (unpadded) token count in the global batch.
         seqlen_squared_sum: Sum of squared real sequence lengths in that batch.
-        num_dsa_layers: Total DSA attention layers, including MTP. For standard
-            models this is ``num_layers + mtp_num_layers``; for hybrid models
-            use the DSA count from ``get_hybrid_layer_counts``. Zero returns
-            immediately without reading DSA arguments.
+        num_dsa_layers: Total DSA attention layers including MTP. Used as the
+            consecutive layer count for standard models; hybrid indexer counts
+            come from the pattern. Zero returns without reading DSA arguments.
 
     Returns:
-        Training FLOPs for DSA attention and its indexer. Callers account for
-        MLPs, other layer types, logits, and MTP norms/projections separately.
+        Training FLOPs for all indexers that execute in the model.
     """
     if num_dsa_layers == 0:
         return 0.0
 
-    per_layer_token_linear, per_layer_core = _dsa_layer_flops(
-        args, total_tokens, seqlen_squared_sum
-    )
     if args.hybrid_layer_pattern is None:
         num_indexer_layers = _num_dsa_indexer_layers(
             num_dsa_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
@@ -303,6 +282,4 @@ def dsa_flops(
             total_tokens, seqlen_squared_sum, args.dsa_indexer_topk
         ),
     )
-    dsa_token_linear_term = num_dsa_layers * per_layer_token_linear + indexer_token_linear
-    dsa_core_term = num_dsa_layers * per_layer_core + indexer_core
-    return total_tokens * dsa_token_linear_term + seqlen_squared_sum * dsa_core_term
+    return total_tokens * indexer_token_linear + seqlen_squared_sum * indexer_core

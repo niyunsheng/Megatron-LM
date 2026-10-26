@@ -165,7 +165,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
-from megatron.training.logging.dsa_flops import dsa_flops
+from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -1023,7 +1023,11 @@ def num_floating_point_operations(
                                    mamba_state_dim, mamba_head_dim,
                                    mamba_num_groups, mamba_num_heads)
         )
+        dsa_attention_flops = (
+            dsa_layer_flops(args, total_tokens, seqlen_squared_sum) if num_dsa_layers else 0
+        )
         flops_fwd = (
+                num_dsa_layers * dsa_attention_flops +
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
@@ -1039,16 +1043,12 @@ def num_floating_point_operations(
                                                   gdn_conv_kernel_dim, gdn_use_gdn2) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
-        # DSA includes its own attention and indexer forward/backward factors.
-        # Only the other layers receive the common x3 expansion here.
-        return (
-            dsa_flops(
-                args=args,
-                total_tokens=total_tokens,
-                seqlen_squared_sum=seqlen_squared_sum,
-                num_dsa_layers=num_dsa_layers,
-            )
-            + flops_fwd * 3
+        # The indexer has its own loss-dependent backward cost.
+        return flops_fwd * 3 + dsa_indexer_flops(
+            args=args,
+            total_tokens=total_tokens,
+            seqlen_squared_sum=seqlen_squared_sum,
+            num_dsa_layers=num_dsa_layers,
         )
 
     def transformer_flops():
@@ -1124,8 +1124,7 @@ def num_floating_point_operations(
         if args.multi_latent_attention:
             assert not args.group_query_attention
         if args.experimental_attention_variant == "dsa":
-            # The shared DSA counter includes all attention and indexer work.
-            # Add it after the MLP, MTP, and logit terms below.
+            # DSA attention and its indexer are counted separately below.
             standard_self_attn_term = 0
             standard_self_attn_core_term = 0
         elif args.multi_latent_attention:
@@ -1363,7 +1362,12 @@ def num_floating_point_operations(
             + seqlen_squared_sum_in_batch * self_attn_core_term
         )
         if args.experimental_attention_variant == "dsa":
-            total_floating_point_operations += dsa_flops(
+            total_floating_point_operations += (
+                num_layers
+                * dsa_layer_flops(args, total_real_tokens_in_batch, seqlen_squared_sum_in_batch)
+                * forward_backward_expansion_factor
+            )
+            total_floating_point_operations += dsa_indexer_flops(
                 args=args,
                 total_tokens=total_real_tokens_in_batch,
                 seqlen_squared_sum=seqlen_squared_sum_in_batch,

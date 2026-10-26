@@ -18,7 +18,7 @@ import pytest
 import torch
 
 import megatron.training.training as training_module
-from megatron.training.logging.dsa_flops import dsa_flops
+from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
@@ -744,9 +744,11 @@ def _dsa_golden_layer_terms(
     nh = args.num_attention_heads
 
     # ---- MLA projections (token-linear, per layer) ----
-    q_term = args.q_lora_rank * (
-        args.hidden_size + nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1
-    )
+    q_output_dim = nh * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+    if args.q_lora_rank is None:
+        q_term = args.hidden_size * q_output_dim
+    else:
+        q_term = args.q_lora_rank * (args.hidden_size + q_output_dim + 1)
     kv_term = (
         args.kv_lora_rank * (args.hidden_size + nh * (args.qk_head_dim + args.v_head_dim) + 1)
         + args.hidden_size * args.qk_pos_emb_head_dim
@@ -771,7 +773,7 @@ def _dsa_golden_layer_terms(
     # ---- DSA indexer: only layers that compute their own top-k index ----
     idx_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
     idx_token = num_indexer_layers * (
-        args.q_lora_rank * idx_dim  # wq_b
+        (args.hidden_size if args.q_lora_rank is None else args.q_lora_rank) * idx_dim  # wq_b
         + args.hidden_size * args.dsa_indexer_head_dim  # wk
         + args.hidden_size * args.dsa_indexer_n_heads  # weights_proj
     )
@@ -1079,13 +1081,27 @@ def _make_hybrid_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_lo
     return args
 
 
-class TestDSAEntryPoint:
-    """The shared counter preserves each model's indexer layer numbering."""
+class TestDSAFlopsHelpers:
+    """Attention is a single-layer forward count; indexers include backward work."""
+
+    @pytest.mark.parametrize("q_lora_rank", [None, 128])
+    @pytest.mark.parametrize("lengths", [(256, 256), (64, 64, 128, 256)])
+    def test_attention_is_single_layer_forward(self, q_lora_rank, lengths):
+        """The layer counter excludes both indexer work and backward expansion."""
+        args = _make_dsa_args()
+        args.q_lora_rank = q_lora_rank
+        total_tokens = sum(lengths)
+        sum_sq = sum(length**2 for length in lengths)
+        token_term, core_term = _dsa_golden_layer_terms(
+            args, total_tokens, sum_sq, num_dsa_layers=1, num_indexer_layers=0
+        )
+        expected = (total_tokens * token_term + sum_sq * core_term) / 3
+        assert dsa_layer_flops(args, total_tokens, sum_sq) == pytest.approx(expected, rel=1e-15)
 
     @pytest.mark.parametrize("pattern, num_indexer_layers", [(None, 2), ("D-D-|D-D-/D-/D-", 4)])
     @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
     @pytest.mark.parametrize("sparse_loss", [False, True])
-    def test_shared_attention_terms(self, pattern, num_indexer_layers, loss_coeff, sparse_loss):
+    def test_indexer_training_terms(self, pattern, num_indexer_layers, loss_coeff, sparse_loss):
         """Both models have six DSA layers but different indexer counts.
 
         Standard layers 1 and 5 compute an index. The hybrid main pattern
@@ -1101,21 +1117,21 @@ class TestDSAEntryPoint:
         total_tokens = 2 * args.seq_length
         sum_sq = 2 * args.seq_length**2
         token_term, core_term = _dsa_golden_layer_terms(
-            args, total_tokens, sum_sq, num_dsa_layers=6, num_indexer_layers=num_indexer_layers
+            args, total_tokens, sum_sq, num_dsa_layers=0, num_indexer_layers=num_indexer_layers
         )
-        assert dsa_flops(args, total_tokens, sum_sq, num_dsa_layers=6) == (
+        assert dsa_indexer_flops(args, total_tokens, sum_sq, num_dsa_layers=6) == (
             total_tokens * token_term + sum_sq * core_term
         )
 
     def test_no_dsa_layers_needs_no_dsa_arguments(self):
         """Non-DSA hybrid models can call the counter without DSA fields."""
-        assert dsa_flops(SimpleNamespace(), 512, 131072, num_dsa_layers=0) == 0
+        assert dsa_indexer_flops(SimpleNamespace(), 512, 131072, num_dsa_layers=0) == 0
 
 
 class TestHybridDSA:
     """Hybrid-path ('D' layers in --hybrid-layer-pattern) DSA accounting.
 
-    'D' layers contribute through ``dsa_flops``; deleting them from the
+    'D' layers contribute attention and indexer FLOPs; deleting them from the
     pattern leaves every other term unchanged. The delta against the
     D-less pattern therefore isolates exactly the DSA terms.
     """
