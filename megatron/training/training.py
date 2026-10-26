@@ -1012,7 +1012,7 @@ def num_floating_point_operations(
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
                      vocab_size=256000, mtp_num_layers=0):
-        """Calculate total FLOPs for the hybrid model."""
+        """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
